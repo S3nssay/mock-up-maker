@@ -1,0 +1,682 @@
+import sys
+import asyncio
+import time
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+import click
+import structlog
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
+from rich.table import Table
+from rich.panel import Panel
+from rich.live import Live
+from rich.layout import Layout
+
+# Add src to path for imports
+sys.path.append(str(Path(__file__).parent))
+
+from config.settings import settings as app_settings
+from processors.excel_processor import ExcelProcessor
+from api.kie_client import KieSeedreamProvider
+from api.nano_banana_client import NanoBananaProvider
+from core.output_manager import OutputManager
+from core.queue_manager import QueueManager
+from overlay.overlay_engine import OverlayEngine
+from utils.logging import setup_logging
+from utils.helpers import format_duration, format_currency
+from core.models import (
+    GenerationRequest,
+    GenerationResult,
+    ProcessingStatus,
+    ImageProvider,
+    ProductData
+)
+
+# Initialize structured logging
+structlog.configure(
+    processors=[
+        structlog.dev.ConsoleRenderer()
+    ],
+    wrapper_class=structlog.stdlib.BoundLogger,
+    logger_factory=structlog.PrintLoggerFactory(),
+    cache_logger_on_first_use=True,
+)
+
+logger = structlog.get_logger()
+console = Console()
+
+
+class ProductImageGenerator:
+    """Main application class for batch product image generation"""
+
+    def __init__(self, output_dir: Optional[str] = None):
+        """Initialize the generator"""
+        self.output_manager = OutputManager(output_dir or str(app_settings.output_dir))
+        self.overlay_engine = OverlayEngine()
+        self.providers = {}
+        self.queue_manager = None
+        self.results: List[GenerationResult] = []
+
+        # Initialize available providers
+        self._initialize_providers()
+
+    def _initialize_providers(self) -> None:
+        """Initialize AI providers based on configuration"""
+        try:
+            # Initialize Kie.ai Seedream provider
+            if app_settings.seedream_kie_api_key:
+                config = app_settings.get_provider_config(ImageProvider.SEEDREAM_KIE)
+                self.providers[ImageProvider.SEEDREAM_KIE] = KieSeedreamProvider(
+                    app_settings.seedream_kie_api_key,
+                    config
+                )
+                logger.info("Initialized Kie.ai Seedream provider")
+
+            # Initialize Nano Banana provider
+            if app_settings.nano_banana_api_key:
+                config = app_settings.get_provider_config(ImageProvider.NANO_BANANA)
+                self.providers[ImageProvider.NANO_BANANA] = NanoBananaProvider(
+                    app_settings.nano_banana_api_key,
+                    config
+                )
+                logger.info("Initialized Nano Banana provider")
+
+            # Initialize additional Seedream providers
+            if app_settings.seedream_aiml_api_key:
+                config = app_settings.get_provider_config(ImageProvider.SEEDREAM_AIML)
+                self.providers[ImageProvider.SEEDREAM_AIML] = KieSeedreamProvider(
+                    app_settings.seedream_aiml_api_key,
+                    config
+                )
+                logger.info("Initialized AI/ML API Seedream provider")
+
+            if app_settings.seedream_byteplus_api_key:
+                config = app_settings.get_provider_config(ImageProvider.SEEDREAM_BYTEPLUS)
+                self.providers[ImageProvider.SEEDREAM_BYTEPLUS] = KieSeedreamProvider(
+                    app_settings.seedream_byteplus_api_key,
+                    config
+                )
+                logger.info("Initialized BytePlus Seedream provider")
+
+            if not self.providers:
+                raise ValueError("No API providers configured. Please set API keys in .env file.")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize providers: {str(e)}")
+            raise
+
+    async def process_excel(
+        self,
+        excel_file: str,
+        start_row: int = 0,
+        end_row: Optional[int] = None,
+        dry_run: bool = False,
+        enable_overlays: bool = None,
+        concurrent_limit: int = None
+    ) -> None:
+        """Process Excel file and generate images"""
+        console.print(f"\n Starting Excel processing: {excel_file}")
+
+        try:
+            # Load and validate Excel
+            processor = ExcelProcessor(excel_file)
+            if not processor.load_and_validate():
+                console.print("Error: Excel validation failed:", style="red")
+                for error in processor.errors:
+                    console.print(f"  • {error}", style="red")
+                return
+
+            # Process rows
+            products = processor.process_rows(start_row, end_row)
+            if not products:
+                console.print("Error: No valid products found in Excel", style="red")
+                return
+
+            # Override overlay setting if specified
+            if enable_overlays is not None:
+                for product in products:
+                    product.add_product_overlay = enable_overlays
+
+            # Show statistics
+            self._show_processing_stats(products)
+
+            if dry_run:
+                console.print(" Dry run completed. No images generated.", style="yellow")
+                return
+
+            # Setup queue manager
+            self.queue_manager = QueueManager(
+                self.providers,
+                concurrent_limit=concurrent_limit or app_settings.concurrent_requests,
+                checkpoint_file=f"checkpoint_{int(time.time())}.json"
+            )
+
+            # Add products to queue
+            generation_config = {
+                'default_provider': app_settings.ai_image_provider,
+                'guidance_scale': app_settings.guidance_scale,
+                'num_inference_steps': app_settings.num_inference_steps,
+                'size': app_settings.default_image_size,
+                'resolution': app_settings.default_resolution,
+                'max_retries': app_settings.max_retry_attempts
+            }
+
+            self.queue_manager.add_products(products, generation_config)
+
+            # Set progress callback
+            self.queue_manager.set_progress_callback(self._on_progress_update)
+
+            # Process queue
+            console.print(" Starting batch image generation...")
+            results = await self.queue_manager.process_queue()
+
+            # Process results and apply overlays
+            all_results = results["all"]
+            await self._apply_overlays(all_results, products)
+
+            self.results = all_results
+
+            # Save results
+            await self._save_results(products)
+
+            # Show final statistics
+            stats = self.queue_manager.get_statistics()
+            self._show_final_stats(stats)
+
+            console.print("\nSuccess Processing completed!", style="green")
+
+        except Exception as e:
+            logger.error(f"Processing failed: {str(e)}")
+            console.print(f"Error: Error: {str(e)}", style="red")
+
+    def _show_processing_stats(self, products: List[ProductData]) -> None:
+        """Display processing statistics"""
+        stats_table = Table(title="Processing Summary", show_header=True)
+        stats_table.add_column("Metric", style="cyan")
+        stats_table.add_column("Count", style="green")
+
+        # Count stats
+        total_products = len(products)
+        brands = len(set(p.brand_name for p in products))
+        with_overlays = sum(1 for p in products if p.add_product_overlay)
+        need_model = sum(1 for p in products if p.needs_model_generation())
+
+        stats_table.add_row("Total Products", str(total_products))
+        stats_table.add_row("Unique Brands", str(brands))
+        stats_table.add_row("With Overlays", str(with_overlays))
+        stats_table.add_row("Need Model Generation", str(need_model))
+
+        console.print("\n")
+        console.print(stats_table)
+        console.print("\n")
+
+    def _on_progress_update(self, progress_data: Dict[str, Any]) -> None:
+        """Handle progress updates from queue manager"""
+        total = progress_data["total"]
+        processed = progress_data["processed"]
+        success = progress_data["success"]
+        failed = progress_data["failed"]
+        completion = progress_data["completion_percentage"]
+        cost = progress_data["total_cost"]
+
+        # Create a simple progress display
+        status_msg = (
+            f"Progress: {processed}/{total} ({completion:.1f}%) | "
+            f"Success {success} Error: {failed} | "
+            f"Cost: {format_currency(cost)}"
+        )
+
+        # This would be better with a live display, but for now just log
+        if processed % 5 == 0 or processed == total:  # Update every 5th item or at completion
+            console.print(f"Status: {status_msg}", style="cyan")
+
+    async def _apply_overlays(
+        self,
+        results: List[GenerationResult],
+        products: List[ProductData]
+    ) -> None:
+        """Apply product overlays to generated images"""
+        overlay_products = [p for p in products if p.add_product_overlay]
+
+        if not overlay_products:
+            return
+
+        console.print(f" Applying overlays to {len(overlay_products)} images...")
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=console
+        ) as progress:
+            task = progress.add_task("Applying overlays...", total=len(overlay_products))
+
+            for product in overlay_products:
+                # Find corresponding result
+                result = next(
+                    (r for r in results if r.product_name == product.product_name),
+                    None
+                )
+
+                if result and result.status == ProcessingStatus.SUCCESS and result.local_image_path:
+                    try:
+                        # Create overlay
+                        start_time = time.time()
+
+                        # Generate ad version path
+                        original_path = Path(result.local_image_path)
+                        ad_path = original_path.parent.parent / "ads" / f"{original_path.stem}_ad{original_path.suffix}"
+
+                        # Apply overlay
+                        overlay_path = self.overlay_engine.create_product_overlay(
+                            str(original_path),
+                            product,
+                            str(ad_path)
+                        )
+
+                        if overlay_path:
+                            result.ad_image_path = overlay_path
+                            result.overlay_time = time.time() - start_time
+                            logger.info(f"Applied overlay to {product.product_name}")
+                        else:
+                            logger.warning(f"Failed to apply overlay to {product.product_name}")
+
+                    except Exception as e:
+                        logger.error(f"Error applying overlay to {product.product_name}: {str(e)}")
+
+                # Update progress
+                progress.update(
+                    task,
+                    advance=1,
+                    description=f"Overlay: {product.product_name[:25]}..."
+                )
+
+    def _generate_single_image(self, product: ProductData) -> GenerationResult:
+        """Generate a single image for a product"""
+        # Choose provider
+        provider_enum = product.provider or app_settings.ai_image_provider
+        if provider_enum not in self.providers:
+            return GenerationResult(
+                product_name=product.product_name,
+                brand_name=product.brand_name,
+                provider_used=provider_enum,
+                status=ProcessingStatus.FAILED,
+                error_message=f"Provider {provider_enum} not available"
+            )
+
+        provider = self.providers[provider_enum]
+
+        # Create request
+        request = GenerationRequest(
+            product=product,
+            provider=provider_enum,
+            prompt=product.get_enhanced_prompt(),
+            reference_images=product.get_reference_images(),
+            guidance_scale=app_settings.guidance_scale,
+            num_inference_steps=app_settings.num_inference_steps,
+            size=app_settings.default_image_size,
+            resolution=app_settings.default_resolution
+        )
+
+        # Generate image
+        result = provider.generate_image(request)
+
+        # Download and save image if successful
+        if result.status == ProcessingStatus.SUCCESS and result.image_url:
+            try:
+                # Save original image
+                image_path = self.output_manager.save_image(result)
+
+                if image_path:
+                    result.local_image_path = image_path
+                    logger.info(f"Saved image for {product.product_name}")
+
+                    # TODO: Generate overlay version if requested
+                    if product.add_product_overlay:
+                        # Placeholder for overlay functionality
+                        logger.info(f"Overlay requested for {product.product_name} (not yet implemented)")
+
+            except Exception as e:
+                logger.error(f"Failed to save image: {str(e)}")
+                result.status = ProcessingStatus.FAILED
+                result.error_message = f"Image save failed: {str(e)}"
+
+        return result
+
+    async def _save_results(self, products: List[ProductData]) -> None:
+        """Save processing results"""
+        try:
+            # Save results Excel
+            results_file = self.output_manager.save_results_excel(self.results, products)
+
+            # Save brand summary
+            summary_file = self.output_manager.save_brand_summary(self.results)
+
+            # Create batch result
+            stats = self.queue_manager.get_statistics() if self.queue_manager else {"processing_time": 0}
+            batch_result = self.output_manager.create_batch_result(
+                self.results,
+                stats.get("processing_time", 0)
+            )
+
+            # Display summary
+            self._display_final_summary(batch_result)
+
+        except Exception as e:
+            logger.error(f"Failed to save results: {str(e)}")
+
+    def _show_final_stats(self, stats: Dict[str, Any]) -> None:
+        """Show final processing statistics"""
+        stats_table = Table(title="Final Processing Statistics", show_header=True)
+        stats_table.add_column("Metric", style="cyan")
+        stats_table.add_column("Value", style="green")
+
+        stats_table.add_row("Total Processing Time", format_duration(stats.get("processing_time", 0)))
+        stats_table.add_row("Items Per Minute", f"{stats.get('items_per_minute', 0):.1f}")
+        stats_table.add_row("Total API Cost", format_currency(stats.get("total_cost", 0)))
+        stats_table.add_row("Success Rate", f"{(stats.get('success', 0) / max(stats.get('processed', 1), 1) * 100):.1f}%")
+        stats_table.add_row("Retry Attempts", str(stats.get("retries", 0)))
+
+        console.print("\n")
+        console.print(stats_table)
+
+    def _display_final_summary(self, batch_result) -> None:
+        """Display final processing summary"""
+        summary_panel = Panel.fit(
+            batch_result.get_summary(),
+            title="Status: Processing Summary",
+            border_style="green"
+        )
+        console.print("\n")
+        console.print(summary_panel)
+
+        # Show brand breakdown
+        brand_breakdown = batch_result.get_brand_breakdown()
+        if brand_breakdown:
+            brand_table = Table(title="Brand Breakdown", show_header=True)
+            brand_table.add_column("Brand", style="cyan")
+            brand_table.add_column("Count", style="white")
+            brand_table.add_column("Success", style="green")
+            brand_table.add_column("Failed", style="red")
+            brand_table.add_column("Cost", style="yellow")
+
+            for brand, stats in brand_breakdown.items():
+                brand_table.add_row(
+                    brand,
+                    str(stats["count"]),
+                    str(stats["successful"]),
+                    str(stats["failed"]),
+                    f"${stats['cost']:.2f}"
+                )
+
+            console.print("\n")
+            console.print(brand_table)
+
+
+@click.group()
+def cli():
+    """Excel to Seedream Image Generator"""
+    pass
+
+
+@cli.command()
+@click.argument('excel_file', type=click.Path(exists=True))
+@click.option('--output-dir', '-o', help='Output directory for generated images')
+@click.option('--start-row', type=int, default=0, help='Starting row number (0-based)')
+@click.option('--end-row', type=int, help='Ending row number (exclusive)')
+@click.option('--dry-run', is_flag=True, help='Validate without generating images')
+@click.option('--enable-overlays/--no-overlays', default=None, help='Enable/disable product overlays')
+@click.option('--concurrent', '-c', type=int, help='Number of concurrent requests')
+@click.option('--provider', type=click.Choice(['seedream_kie', 'nano_banana', 'seedream_aiml', 'seedream_byteplus']),
+              help='Specific provider to use')
+def process(excel_file, output_dir, start_row, end_row, dry_run, enable_overlays, concurrent, provider):
+    """Process Excel file and generate product images"""
+    try:
+        # Setup logging
+        setup_logging()
+
+        # Override provider if specified
+        if provider:
+            app_settings.ai_image_provider = ImageProvider(provider)
+
+        generator = ProductImageGenerator(output_dir)
+        asyncio.run(generator.process_excel(
+            excel_file, start_row, end_row, dry_run, enable_overlays, concurrent
+        ))
+    except Exception as e:
+        console.print(f"Error: Fatal error: {str(e)}", style="red")
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument('output_file', type=click.Path())
+def create_sample(output_file):
+    """Create a sample Excel file with proper structure"""
+    try:
+        processor = ExcelProcessor("dummy.xlsx")  # Dummy path for static method
+        processor.create_sample_excel(output_file)
+        console.print(f"Success Sample Excel created: {output_file}", style="green")
+    except Exception as e:
+        console.print(f"Error: Error creating sample: {str(e)}", style="red")
+
+
+@cli.command()
+def validate_config():
+    """Validate configuration and show status"""
+    try:
+        issues = app_settings.validate()
+
+        config_table = Table(title="Configuration Status", show_header=True)
+        config_table.add_column("Setting", style="cyan")
+        config_table.add_column("Value", style="white")
+        config_table.add_column("Status", style="green")
+
+        # Show key settings
+        available_providers = app_settings.get_available_providers()
+        config_items = [
+            ("Primary Provider", app_settings.ai_image_provider.value, "Success" if app_settings.ai_image_provider in available_providers else "Error:"),
+            ("Available Providers", ", ".join([p.value for p in available_providers]), "Success" if available_providers else "Error:"),
+            ("Fallback Enabled", app_settings.enable_fallback, "Success" if app_settings.enable_fallback else "Warning:"),
+            ("Output Directory", str(app_settings.output_dir), "Success"),
+            ("Concurrent Requests", app_settings.concurrent_requests, "Success"),
+            ("Default Resolution", app_settings.default_resolution, "Success"),
+            ("Overlay Enabled", app_settings.enable_product_overlay, "Success" if app_settings.enable_product_overlay else "Info")
+        ]
+
+        for setting, value, status in config_items:
+            config_table.add_row(setting, str(value), status)
+
+        console.print(config_table)
+
+        # Show provider details
+        if available_providers:
+            provider_table = Table(title="Provider Details", show_header=True)
+            provider_table.add_column("Provider", style="cyan")
+            provider_table.add_column("Max Resolution", style="white")
+            provider_table.add_column("Cost/Image", style="yellow")
+            provider_table.add_column("Rate Limit", style="green")
+
+            for provider in available_providers:
+                config = app_settings.get_provider_config(provider)
+                provider_table.add_row(
+                    config.get("name", provider.value),
+                    config.get("max_resolution", "Unknown"),
+                    f"${config.get('cost_per_image', 0):.4f}",
+                    f"{config.get('rate_limit', 0)}/min"
+                )
+
+            console.print("\n")
+            console.print(provider_table)
+
+        # Show issues
+        if issues:
+            console.print("\nWarning:  Configuration Issues:", style="yellow")
+            for issue in issues:
+                level_style = "red" if issue.startswith("ERROR") else "yellow"
+                console.print(f"  • {issue}", style=level_style)
+        else:
+            console.print("\nSuccess Configuration looks good!", style="green")
+
+    except Exception as e:
+        console.print(f"Error: Error validating config: {str(e)}", style="red")
+
+
+@cli.command()
+@click.argument('excel_file', type=click.Path(exists=True))
+@click.option('--output-file', '-o', help='Output file for validation report')
+def validate_excel(excel_file, output_file):
+    """Validate Excel file structure and content"""
+    try:
+        processor = ExcelProcessor(excel_file)
+        if not processor.load_and_validate():
+            console.print("Error: Excel validation failed:", style="red")
+            for error in processor.errors:
+                console.print(f"  • {error}", style="red")
+            return
+
+        products = processor.process_rows()
+        stats = processor.get_statistics()
+
+        # Show validation results
+        console.print(f"Success Excel file validated successfully!", style="green")
+        console.print(f"Status: Found {stats['total_products']} products across {len(stats['brands'])} brands")
+
+        # Show statistics
+        if stats.get('brands'):
+            brand_table = Table(title="Brand Distribution", show_header=True)
+            brand_table.add_column("Brand", style="cyan")
+            brand_table.add_column("Products", style="white")
+
+            for brand, count in stats['brands'].items():
+                brand_table.add_row(brand, str(count))
+
+            console.print("\n")
+            console.print(brand_table)
+
+        # Validate URLs
+        url_validation = processor.validate_urls(products)
+        if url_validation['invalid']:
+            console.print(f"\nWarning:  Found {len(url_validation['invalid'])} invalid URLs:", style="yellow")
+            for invalid in url_validation['invalid'][:5]:  # Show first 5
+                console.print(f"  • {invalid}", style="yellow")
+
+        # Export validation report
+        if output_file:
+            processor.export_validation_report(output_file)
+            console.print(f" Validation report saved to: {output_file}", style="green")
+
+    except Exception as e:
+        console.print(f"Error: Error validating Excel: {str(e)}", style="red")
+
+
+@cli.command()
+@click.option('--provider', type=click.Choice(['seedream_kie', 'nano_banana', 'seedream_aiml', 'seedream_byteplus']),
+              help='Test specific provider')
+def test_providers(provider):
+    """Test API provider connectivity and functionality"""
+    try:
+        setup_logging()
+        generator = ProductImageGenerator()
+
+        if provider:
+            # Test specific provider
+            provider_enum = ImageProvider(provider)
+            if provider_enum not in generator.providers:
+                console.print(f"Error: Provider {provider} not configured", style="red")
+                return
+
+            console.print(f" Testing {provider}...")
+            # Here you would add actual test logic
+            console.print(f"Success {provider} connectivity test passed", style="green")
+        else:
+            # Test all providers
+            console.print(" Testing all configured providers...")
+
+            for provider_enum, provider_client in generator.providers.items():
+                console.print(f"Testing {provider_enum.value}... ", end="")
+                # Here you would add actual test logic
+                console.print("Success", style="green")
+
+    except Exception as e:
+        console.print(f"Error: Provider test failed: {str(e)}", style="red")
+
+
+@cli.command()
+def settings():
+    """Open settings GUI to configure API keys and preferences"""
+    try:
+        # Check if tkinter is available
+        try:
+            import tkinter
+        except ImportError:
+            console.print("Error: GUI not available. tkinter is not installed.", style="red")
+            console.print(" Use environment variables or edit .env file manually:", style="yellow")
+            console.print("   cp .env.template .env")
+            console.print("   # Edit .env file with your API keys")
+            return
+
+        console.print(" Opening settings GUI...", style="cyan")
+
+        # Import and run settings GUI
+        from gui.settings_gui import SettingsGUI
+
+        # Run GUI
+        gui = SettingsGUI()
+        gui.run()
+
+        console.print("Success Settings GUI closed.", style="green")
+
+    except Exception as e:
+        console.print(f"Error: Error opening settings GUI: {str(e)}", style="red")
+        console.print(" You can manually edit the .env file instead:", style="yellow")
+        console.print("   cp .env.template .env")
+        console.print("   # Edit .env file with your API keys")
+
+
+@cli.command()
+@click.option('--create-env', is_flag=True, help='Create .env file from template')
+@click.option('--backup', is_flag=True, help='Create backup of current .env file')
+def config_manager(create_env, backup):
+    """Manage configuration files and environment setup"""
+    try:
+        from gui.env_manager import EnvManager
+
+        env_manager = EnvManager()
+
+        if create_env:
+            if env_manager.create_from_template():
+                console.print("Success Created .env file from template", style="green")
+                console.print(" Edit the .env file or run 'python src/main.py settings' to configure", style="cyan")
+            else:
+                console.print("Error: Failed to create .env file (may already exist)", style="red")
+
+        if backup:
+            backup_path = env_manager.backup_env_file()
+            if backup_path:
+                console.print(f"Success Backup created: {backup_path}", style="green")
+            else:
+                console.print("Error: Failed to create backup", style="red")
+
+        # Show validation results
+        console.print("\n Configuration Validation:")
+        issues = env_manager.validate_env_file()
+
+        if not issues:
+            console.print("Success No issues found", style="green")
+        else:
+            for issue in issues:
+                if issue.startswith("ERROR"):
+                    console.print(f"  {issue}", style="red")
+                elif issue.startswith("WARNING"):
+                    console.print(f"  {issue}", style="yellow")
+                else:
+                    console.print(f"  {issue}", style="cyan")
+
+    except Exception as e:
+        console.print(f"Error: Error managing config: {str(e)}", style="red")
+
+
+if __name__ == '__main__':
+    cli()

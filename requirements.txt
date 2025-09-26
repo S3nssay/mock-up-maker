@@ -1,0 +1,28 @@
+# Core Dependencies
+pandas==2.1.4
+openpyxl==3.1.2
+requests==2.31.0
+aiohttp==3.9.1
+pydantic==2.5.3
+python-dotenv==1.0.0
+click==8.1.7
+Pillow==10.2.0
+qrcode==7.4.2
+PyYAML==6.0.1
+
+# Enhanced UI/UX
+rich==13.7.0
+tqdm==4.66.1
+
+# Logging and Error Handling
+structlog==24.1.0
+tenacity==8.2.3
+
+# Async Support
+asyncio-throttle==1.0.2
+
+# Image Processing
+numpy==1.26.3
+
+# GUI Framework
+tkinter-tooltip==2.0.1
