@@ -14,7 +14,7 @@ setup(
     description="AI-Powered Product Mockup and Marketing Image Generator",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/claude/mock-up-maker",
+    url="https://github.com/S3nssay/mock-up-maker",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 4 - Beta",
