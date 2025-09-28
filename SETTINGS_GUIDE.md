@@ -2,7 +2,7 @@
 
 ## ✅ **FEATURE COMPLETED!**
 
-The Excel Seedream Generator now includes a **comprehensive settings GUI** that makes API key management and configuration effortless!
+Mock Up Maker now includes a **comprehensive settings GUI** that makes API key management and configuration effortless!
 
 ---
 
@@ -241,10 +241,10 @@ python src/main.py config-manager
 
 With the settings GUI configured, you can now:
 
-✅ **Generate Images**: Process Excel files with confidence
-✅ **Professional Results**: High-quality product imagery
+✅ **Generate Mockups**: Create professional product mockups from Excel data
+✅ **Professional Results**: High-quality marketing imagery
 ✅ **Cost Control**: Stay within budget with monitoring
 ✅ **Reliable Processing**: Automatic fallback between providers
 ✅ **Easy Management**: GUI-based configuration updates
 
-**The Excel Seedream Generator is now fully configured and ready for production use!** 🚀
+**Mock Up Maker is now fully configured and ready for production use!** 🚀

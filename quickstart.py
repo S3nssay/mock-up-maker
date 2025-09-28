@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Quick Start Script for Excel Seedream Generator
+Quick Start Script for Mock Up Maker
 
 This script demonstrates basic usage and helps you get started quickly.
 """
@@ -114,7 +114,7 @@ def check_environment():
 def main():
     """Main quickstart function"""
     print("=" * 60)
-    print("EXCEL SEEDREAM GENERATOR - QUICK START")
+    print("MOCK UP MAKER - QUICK START")
     print("=" * 60)
 
     # Check environment

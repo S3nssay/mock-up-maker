@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Standalone Settings GUI Launcher
+Mock Up Maker - Settings GUI Launcher
 Quick way to configure API keys and settings without CLI
 """
 
@@ -13,7 +13,7 @@ sys.path.insert(0, str(src_path))
 
 def main():
     """Launch the settings GUI"""
-    print("Excel Seedream Generator - Settings")
+    print("Mock Up Maker - Settings")
     print("=" * 50)
 
     try:

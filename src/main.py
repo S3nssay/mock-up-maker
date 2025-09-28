@@ -417,7 +417,7 @@ class ProductImageGenerator:
 
 @click.group()
 def cli():
-    """Excel to Seedream Image Generator"""
+    """Mock Up Maker - AI-Powered Product Mockup Generator"""
     pass
 
 
@@ -605,7 +605,7 @@ def test_providers(provider):
 
 @cli.command()
 def settings():
-    """Open settings GUI to configure API keys and preferences"""
+    """Open Mock Up Maker settings GUI to configure API keys and preferences"""
     try:
         # Check if tkinter is available
         try:

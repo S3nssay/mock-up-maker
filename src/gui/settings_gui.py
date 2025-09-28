@@ -20,7 +20,7 @@ class SettingsGUI:
     def __init__(self, root: Optional[tk.Tk] = None):
         """Initialize the settings GUI"""
         self.root = root or tk.Tk()
-        self.root.title("Excel Seedream Generator - Settings")
+        self.root.title("Mock Up Maker - Settings")
         self.root.geometry("800x700")
         self.root.resizable(True, True)
 

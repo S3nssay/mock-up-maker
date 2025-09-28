@@ -1,6 +1,6 @@
-# Excel to Seedream Image Generator
+# Mock Up Maker
 
-A powerful Python application that processes Excel spreadsheets containing product information and generates AI images using ByteDance's Seedream 4.0 API through multiple providers (Kie.ai, AI/ML API, BytePlus, and Nano Banana).
+A powerful Python application that processes Excel spreadsheets containing product information and generates AI-powered product mockups and marketing images using ByteDance's Seedream 4.0 API through multiple providers (Kie.ai, AI/ML API, BytePlus, and Nano Banana).
 
 ## 🚀 Features
 
